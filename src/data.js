@@ -6,7 +6,7 @@ export const MILLS = {
 };
 export const DISTRICTS = ['Jinja', 'Luuka', 'Kamuli', 'Mayuge', 'Iganga', 'Buikwe', 'Other'];
 export const STATUS = {
-  awaiting: ['Awaiting transporter', 'amber'], accepted: ['Transporter accepted', 'blue'], confirmed: ['Confirmed', 'teal'],
+  awaiting: ['Awaiting transporter', 'amber'], requested: ['Transporter requested', 'indigo'], accepted: ['Approved by farmer', 'blue'], confirmed: ['Confirmed', 'teal'],
   'in-progress': ['In transit', 'indigo'], completed: ['Completed', 'green'], cancelled: ['Cancelled', 'grey'], disputed: ['Disputed', 'red']
 };
 // Defaults used until an admin saves platform settings (config/platform in Firestore).

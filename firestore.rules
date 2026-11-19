@@ -1,9 +1,181 @@
 rules_version = '2';
-
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /{document=**} {
-      allow read, write: if false;
+    function signed() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function isAdmin() { return signed() && me().role == 'admin'; }
+    function isVerified(role) { return signed() && me().role == role && me().verified == true; }
+    function cfg() { return get(/databases/$(database)/documents/config/platform).data; }
+    function bk(bid) { return get(/databases/$(database)/documents/bookings/$(bid)).data; }
+    function bkAfter(bid) { return getAfter(/databases/$(database)/documents/bookings/$(bid)).data; }
+    function only(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    // True if u is the farmer or the transporter on this booking, before or after the current write.
+    function party(bid, u) {
+      return bk(bid).get('farmerId', null) == u || bk(bid).get('transporterId', null) == u
+        || bkAfter(bid).get('farmerId', null) == u || bkAfter(bid).get('transporterId', null) == u;
+    }
+
+    match /users/{uid} {
+      allow read: if signed() && (request.auth.uid == uid || isAdmin());
+      allow create: if signed() && request.auth.uid == uid
+        && request.resource.data.role in ['farmer', 'transporter', 'mill']
+        && request.resource.data.verified == false
+        && request.resource.data.keys().hasOnly(['name', 'phone', 'role', 'district', 'verified', 'createdAt', 'millId'])
+        && (!('millId' in request.resource.data) || (request.resource.data.role == 'mill' && request.resource.data.millId == request.auth.uid));
+      allow update: if isAdmin() || (request.auth.uid == uid && only(['name', 'district']));
+    }
+
+    match /bookings/{bid} {
+      // Mills do not read bookings. They get a price-free copy in /deliveries.
+      allow read: if signed() && (
+        isAdmin()
+        || resource.data.farmerId == request.auth.uid
+        || resource.data.get('transporterId', null) == request.auth.uid
+        || (isVerified('transporter') && resource.data.status == 'awaiting'));
+
+      allow create: if signed() && me().role == 'farmer'
+        && request.resource.data.farmerId == request.auth.uid
+        && request.resource.data.status == 'awaiting'
+        && request.resource.data.tons > 0 && request.resource.data.price >= 0;
+
+      allow update: if isAdmin()
+        // Farmer
+        || (resource.data.farmerId == request.auth.uid && (
+              // approve a transporter's request
+              (resource.data.status == 'requested' && request.resource.data.status == 'accepted'
+                && only(['status', 'timeline', 'updatedAt']))
+              // decline a request, or withdraw approval before any fee is submitted: the job reopens
+              || (resource.data.status in ['requested', 'accepted'] && resource.data.get('feeStatus', null) == null
+                && request.resource.data.status == 'awaiting' && request.resource.data.transporterId == null
+                && only(['status', 'transporterId', 'transporterName', 'timeline', 'updatedAt']))
+              // confirm the agreed price, only after the unlock fee is confirmed
+              || (resource.data.status == 'accepted' && resource.data.get('feeStatus', null) == 'paid'
+                && request.resource.data.status == 'confirmed'
+                && only(['status', 'price', 'hasDelivery', 'timeline', 'updatedAt']))
+              // cancel or report a problem
+              || (request.resource.data.status in ['cancelled', 'disputed'] && only(['status', 'timeline', 'updatedAt']))))
+        // Verified transporter requests an open job. The lock document enforces one active job at a time.
+        || (isVerified('transporter') && resource.data.status == 'awaiting'
+            && request.resource.data.status == 'requested'
+            && request.resource.data.transporterId == request.auth.uid
+            && getAfter(/databases/$(database)/documents/locks/$(request.auth.uid)).data.bookingId == bid
+            && only(['status', 'transporterId', 'transporterName', 'timeline', 'updatedAt']))
+        // Transporter withdraws before paying
+        || (resource.data.get('transporterId', null) == request.auth.uid
+            && resource.data.status in ['requested', 'accepted'] && resource.data.get('feeStatus', null) == null
+            && request.resource.data.status == 'awaiting' && request.resource.data.transporterId == null
+            && only(['status', 'transporterId', 'transporterName', 'timeline', 'updatedAt']))
+        // Transporter submits the unlock fee after the farmer approves. The amount comes from platform settings.
+        || (resource.data.get('transporterId', null) == request.auth.uid
+            && resource.data.status == 'accepted' && resource.data.get('feeStatus', null) == null
+            && request.resource.data.fee == cfg().feeUgx
+            && request.resource.data.feeStatus == 'pending'
+            && request.resource.data.feeRef is string && request.resource.data.feeRef.size() >= 6
+            && only(['fee', 'feeStatus', 'feeRef', 'updatedAt']))
+        // Assigned transporter (fee confirmed): start trip, share location, complete, or report
+        || (resource.data.get('transporterId', null) == request.auth.uid && resource.data.get('feeStatus', null) == 'paid'
+            && (request.resource.data.status == resource.data.status
+                || (resource.data.status == 'confirmed' && request.resource.data.status == 'in-progress')
+                || (resource.data.status == 'in-progress' && request.resource.data.status == 'completed')
+                || request.resource.data.status == 'disputed')
+            && only(['status', 'liveLoc', 'timeline', 'updatedAt']));
+
+      match /private/{doc} {
+        // contact = farmer phone + exact pin. tcontact = transporter phone.
+        allow create: if signed() && (
+          (doc == 'contact' && bkAfter(bid).farmerId == request.auth.uid)
+          || (doc == 'tcontact' && bkAfter(bid).get('transporterId', null) == request.auth.uid));
+        allow read: if signed() && (isAdmin()
+          || (doc == 'contact' && (bk(bid).farmerId == request.auth.uid || (bk(bid).get('transporterId', null) == request.auth.uid && bk(bid).get('feeStatus', null) == 'paid')))
+          || (doc == 'tcontact' && (bk(bid).get('transporterId', null) == request.auth.uid || (bk(bid).farmerId == request.auth.uid && bk(bid).get('feeStatus', null) == 'paid'))));
+      }
+
+      match /messages/{mid} {
+        allow read: if signed() && (isAdmin()
+          || (bk(bid).get('feeStatus', null) == 'paid' && (bk(bid).farmerId == request.auth.uid || bk(bid).get('transporterId', null) == request.auth.uid)));
+        allow create: if signed() && bk(bid).get('feeStatus', null) == 'paid' && bk(bid).status != 'cancelled'
+          && (bk(bid).farmerId == request.auth.uid || bk(bid).get('transporterId', null) == request.auth.uid)
+          && request.resource.data.keys().hasOnly(['senderId', 'senderName', 'text', 'at'])
+          && request.resource.data.senderId == request.auth.uid
+          && request.resource.data.text is string && request.resource.data.text.size() > 0 && request.resource.data.text.size() <= 1000
+          && request.resource.data.at == request.time;
+      }
+    }
+
+    // A transporter holds one job at a time: this document exists while they hold one.
+    match /locks/{uid} {
+      allow read: if signed() && (request.auth.uid == uid || isAdmin());
+      allow create: if signed() && request.auth.uid == uid && isVerified('transporter')
+        && request.resource.data.keys().hasOnly(['bookingId', 'createdAt'])
+        && bkAfter(request.resource.data.bookingId).get('transporterId', null) == uid
+        && bkAfter(request.resource.data.bookingId).status == 'requested';
+      allow delete: if resource == null || isAdmin() || (signed() && (
+        (request.auth.uid == uid && bkAfter(resource.data.bookingId).status in ['completed', 'awaiting', 'cancelled'])
+        || (bkAfter(resource.data.bookingId).farmerId == request.auth.uid && bkAfter(resource.data.bookingId).status in ['awaiting', 'cancelled'])));
+    }
+
+    // Price-free copy of a confirmed booking for the mill (no price, fee or phone numbers).
+    match /deliveries/{bid} {
+      allow read: if signed() && (isAdmin()
+        || resource.data.farmerId == request.auth.uid
+        || resource.data.transporterId == request.auth.uid
+        || (isVerified('mill') && resource.data.millId == me().millId));
+      allow create: if signed() && bkAfter(bid).farmerId == request.auth.uid
+        && bkAfter(bid).status == 'confirmed'
+        && request.resource.data.keys().hasOnly(['millId', 'millName', 'farmerId', 'transporterId', 'farmerName', 'transporterName', 'pickupLabel', 'pickup', 'tons', 'date', 'status', 'createdAt', 'updatedAt'])
+        && request.resource.data.farmerId == request.auth.uid
+        && request.resource.data.millId == bkAfter(bid).millId
+        && request.resource.data.transporterId == bkAfter(bid).transporterId
+        && request.resource.data.status == 'confirmed';
+      allow update: if isAdmin()
+        || (resource.data.transporterId == request.auth.uid
+            && request.resource.data.status == bkAfter(bid).status
+            && only(['status', 'liveLoc', 'updatedAt']))
+        || (resource.data.farmerId == request.auth.uid
+            && request.resource.data.status == 'cancelled' && bkAfter(bid).status == 'cancelled'
+            && only(['status', 'updatedAt']))
+        || (isVerified('mill') && resource.data.millId == me().millId
+            && resource.data.status in ['in-progress', 'completed']
+            && request.resource.data.receipt.tons is number && request.resource.data.receipt.tons > 0
+            && only(['receipt', 'updatedAt']));
+    }
+
+    match /notifications/{id} {
+      allow read: if signed() && resource.data.userId == request.auth.uid;
+      allow create: if signed() && request.resource.data.fromId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['userId', 'fromId', 'title', 'body', 'link', 'bookingId', 'read', 'createdAt'])
+        && request.resource.data.read == false
+        && (isAdmin() || (party(request.resource.data.bookingId, request.auth.uid) && party(request.resource.data.bookingId, request.resource.data.userId)));
+      allow update: if signed() && resource.data.userId == request.auth.uid && only(['read']);
+      allow delete: if signed() && resource.data.userId == request.auth.uid;
+    }
+
+    match /mills/{id} {
+      allow read: if signed();
+      // A mill owner registers their own mill at sign-up. It stays pending until an admin approves it.
+      allow create: if (signed() && request.auth.uid == id
+          && request.resource.data.ownerId == request.auth.uid
+          && request.resource.data.status == 'pending'
+          && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'mill')
+        || isAdmin();
+      allow update, delete: if isAdmin();
+    }
+
+    match /intake/{id} {
+      allow read: if signed();
+      allow create: if isAdmin() || (isVerified('mill') && request.resource.data.millId == me().millId);
+      allow update, delete: if isAdmin() || (isVerified('mill') && resource.data.millId == me().millId);
+    }
+
+    match /disputes/{id} {
+      allow read: if signed() && (isAdmin() || resource.data.reporterId == request.auth.uid);
+      allow create: if signed() && request.resource.data.reporterId == request.auth.uid;
+      allow update: if isAdmin();
+    }
+
+    match /config/{id} {
+      allow read: if signed();
+      allow write: if isAdmin();
     }
   }
 }
